@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import warnings
-from io import SEEK_CUR, BytesIO
+from io import SEEK_CUR, SEEK_END, BytesIO
 from types import MethodType
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, TypeVar
 
@@ -22,6 +22,18 @@ if TYPE_CHECKING:
 EOF = -0xE0F  # Negative counts are illegal anyway, so abuse that for our EOF sentinel
 
 _IMMUTABLE_TYPES = (int, float, bytes, str)
+
+# Arrays with a declared length are read in chunks of at most this many bytes. An untrusted length
+# expression can produce an arbitrarily large count, but the bytes that the stream actually holds are
+# the only thing that may be allocated: asking a stream for the full declared length up front would
+# allocate (or raise ``MemoryError``/``OverflowError``) before the missing evidence is discovered.
+READ_CHUNK_SIZE = 1 << 20
+
+# Arrays of an element type that consumes no bytes (an empty structure, a ``void`` element) never
+# reach end-of-file, so their declared count can't be validated against the evidence. Such an array
+# gets a hard budget instead, so a length field can't turn into an unbounded loop that allocates one
+# object per declared entry.
+MAX_ZERO_WIDTH_ARRAY_ENTRIES = 1 << 16
 
 
 class MetaType(type):
@@ -191,9 +203,47 @@ class MetaType(type):
         """
         result = []
         if count == EOF:
+            if cls.__size__ == 0 and not _is_eof(stream):
+                # An element that consumes no bytes never reaches the end of the stream, so this
+                # would never terminate. At EOF the array is legitimately empty.
+                raise ArraySizeError(f"Cannot read {cls.__name__} values until EOF: the type consumes no bytes")
+
+            position = _safe_tell(stream)
             while not _is_eof(stream):
                 result.append(cls._read(stream, context=context, endian=endian))
+
+                if cls.__size__ is None:
+                    current = _safe_tell(stream)
+                    if current is not None and current == position:
+                        # A dynamically sized element made no progress, so this loop would never end
+                        raise ArraySizeError(f"Cannot read {cls.__name__} values until EOF: the type consumes no bytes")
+                    position = current
+
             return result
+
+        if count <= 0:
+            _check_array_count(count)
+            return result
+
+        if count > MAX_ZERO_WIDTH_ARRAY_ENTRIES:
+            # An element type that consumes no bytes never reaches end-of-file, so a large declared
+            # length can't be checked against the evidence. Reject it before allocating anything,
+            # rather than looping over an entry count that no input can satisfy.
+            if cls.__size__ == 0:
+                _check_array_budget(count, cls)
+
+            if cls.__size__ is None:
+                # A dynamically sized element may still consume no bytes, which the type's static
+                # size can't tell us. Read a single value to check that the element makes progress;
+                # only an element that consumes nothing needs the budget, an element that consumes
+                # bytes is bounded by the evidence like any other type.
+                start = _safe_tell(stream)
+                result.append(cls._read(stream, context=context, endian=endian))
+                if _safe_tell(stream) == start:
+                    _check_array_budget(count, cls, dynamic=True)
+                result.extend(cls._read(stream, context=context, endian=endian) for _ in range(count - 1))
+
+                return result
 
         # This is purposefully a simple loop
         # PyPy will pre-allocate the list for a list comprehension ahead of time, which will cause huge allocations in
@@ -367,23 +417,46 @@ class BaseArray(BaseType):
         if cls.__null_terminated__:
             return cls.__type__._read_0(stream, context=context, endian=endian)
 
-        return cls.__type__._read_array(stream, cls._num_entries(context), context=context, endian=endian)
+        count = cls._num_entries(context)
+        if count == EOF:
+            return cls.__type__._read_array(stream, count, context=context, endian=endian)
+
+        count = _validate_array_count(count)
+        cls._check_count_budget(count)
+
+        return cls.__type__._read_array(stream, count, context=context, endian=endian)
 
     @classmethod
     def _num_entries(cls, context: dict[str, Any] | None) -> int:
-        """Return the number of entries to read for this (non null-terminated) array type."""
+        """Return the number of entries to read for this (non null-terminated) array type.
+
+        The result is the raw value of the length expression. Validation of the value (it must be a
+        non-negative integer) happens in :meth:`_read`, so an invalid length is rejected with an
+        ``ArraySizeError`` at the evidence offset of the array instead of being clamped to zero.
+        """
         if isinstance(cls.__num_entries__, int):
-            return max(0, cls.__num_entries__)
+            return cls.__num_entries__
 
         if cls.__num_entries__ is None:
             return EOF
 
         try:
-            return max(0, cls.__num_entries__.evaluate(cls.__cs__, context))
+            return cls.__num_entries__.evaluate(cls.__cs__, context)
         except Exception:
             if cls.__num_entries__.expression != "EOF":
                 raise
             return EOF
+
+    @classmethod
+    def _check_count_budget(cls, count: int) -> None:
+        """Reject an array length that can't be backed by evidence and would only amplify resources.
+
+        A zero-width element type consumes no bytes, so no amount of evidence can satisfy the
+        declared length. Such an array would otherwise turn into a loop that allocates one value per
+        declared entry. The limit is applied to any array length here, so static definitions and
+        dynamic lengths follow the same budget semantics.
+        """
+        _check_array_budget(count, cls.__type__)
 
     @classmethod
     def _write(cls, stream: BinaryIO, data: list[Any], *, endian: Endianness) -> int:
@@ -500,6 +573,156 @@ def _is_eof(stream: BinaryIO) -> bool:
 
     stream.seek(pos)
     return False
+
+
+def _validate_array_count(count: object) -> int:
+    """Validate an array length before it is used to read or allocate anything.
+
+    A length can come from an untrusted field through a length expression. Negative lengths are
+    rejected instead of silently becoming an empty array, because an empty array looks like a
+    complete piece of evidence while a negative length signals a malformed record. Both the compiled
+    and the interpreted reader use this function, so they reject the same count at the same offset.
+
+    Args:
+        count: The value of the length expression.
+
+    Returns:
+        The validated count.
+
+    Raises:
+        ArraySizeError: If the length is not an integer or is negative.
+    """
+    if type(count) is not int:
+        try:
+            count = int(count)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise ArraySizeError(f"Invalid array length {count!r}: not an integer") from None
+
+    if count < 0:
+        raise ArraySizeError(f"Invalid array length {count}: a length can't be negative")
+
+    return count
+
+
+def _check_array_count(count: int) -> int:
+    """Reject the negative counts other than the EOF sentinel before reading anything.
+
+    The public array reader already validates the length it calculates, but a type's
+    ``_read_array`` can also be called directly with a count, e.g. from generated code or a custom
+    type. This keeps every element type consistent: only ``EOF`` may be negative.
+
+    Returns:
+        The count, unchanged.
+
+    Raises:
+        ArraySizeError: If the count is negative and not the EOF sentinel.
+    """
+    if count < 0 and count != EOF:
+        raise ArraySizeError(f"Invalid array length {count}: a length can't be negative")
+
+    return count
+
+
+def _check_array_budget(count: int, element_type: type[BaseType], *, dynamic: bool = False) -> None:
+    """Reject an array length that can't be backed by evidence and would only amplify resources.
+
+    An element type that consumes no bytes (an empty structure, a ``void`` element) never reaches
+    end-of-file, so no amount of evidence can satisfy a large declared length. Reading such an array
+    would allocate one value per declared entry and never fail on a short input. This budget applies
+    to every array, static or dynamic, so both length flavours share the same semantics.
+
+    Args:
+        count: The validated array length.
+        element_type: The type of the array elements.
+        dynamic: The element type has a dynamic size, which may still be zero. A dynamic caller has
+            already established that the element consumes no bytes.
+
+    Raises:
+        ArraySizeError: If the length exceeds the zero-width array budget.
+    """
+    if count <= MAX_ZERO_WIDTH_ARRAY_ENTRIES:
+        return
+
+    if not dynamic and element_type.__size__ != 0:
+        return
+
+    raise ArraySizeError(
+        f"Declared array length {count} exceeds the budget of "
+        f"{MAX_ZERO_WIDTH_ARRAY_ENTRIES} zero-width {element_type.__name__} entries"
+    )
+
+
+def _safe_tell(stream: BinaryIO) -> int | None:
+    """Return the current stream position, or ``None`` if the stream can't tell it."""
+    try:
+        return stream.tell()
+    except Exception:
+        return None
+
+
+def _stream_remaining(stream: BinaryIO) -> int | None:
+    """Return the number of bytes left in the stream, or ``None`` if it can't be determined."""
+    if not _is_seekable(stream):
+        return None
+
+    try:
+        pos = stream.tell()
+        end = stream.seek(0, SEEK_END)
+        stream.seek(pos)
+    except Exception:
+        return None
+
+    return max(0, end - pos)
+
+
+def _read_array_data(stream: BinaryIO, length: int) -> bytes:
+    """Read up to ``length`` bytes of array data without trusting the declared length.
+
+    An array length is usually taken from the evidence and can be arbitrarily large. Passing it to
+    ``stream.read`` directly asks the stream to make room for the whole declared array before it
+    knows that the evidence actually holds it, which lets a few header bytes reserve a lot of memory
+    or raise an unrelated ``MemoryError``/``OverflowError`` instead of a truncation error.
+
+    Only what the stream can actually deliver is requested: the remaining stream size when it is
+    known, otherwise bounded chunks. Like everywhere else in this module, a stream that returns less
+    than requested is treated as being at the end of the evidence. The returned data is therefore
+    shorter than ``length`` at end-of-file, so the caller can reject the array at its evidence
+    offset.
+
+    Args:
+        stream: The stream to read from.
+        length: The declared length in bytes, or ``-1`` to read until EOF.
+    """
+    if length == 0:
+        return b""
+
+    if length < 0:
+        # Read until the end of the evidence, there is no declared length to allocate for
+        return stream.read()
+
+    if length <= READ_CHUNK_SIZE:
+        return stream.read(length)
+
+    if (remaining := _stream_remaining(stream)) is not None and remaining < length:
+        # Never ask for more than the evidence can hold
+        length = remaining
+
+        if length <= READ_CHUNK_SIZE:
+            return stream.read(length)
+
+    buf = bytearray()
+    remaining = length
+    while remaining > 0:
+        want = min(remaining, READ_CHUNK_SIZE)
+        chunk = stream.read(want)
+        buf += chunk
+        remaining -= len(chunk)
+
+        if len(chunk) < want:
+            # End of the evidence, or a stream that delivers less than requested
+            break
+
+    return bytes(buf)
 
 
 # As mentioned in the BaseType class, we correctly set the type here

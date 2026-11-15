@@ -23,6 +23,7 @@ from dissect.cstruct.types.base import (
     BaseType,
     MetaType,
     _is_buffer_type,
+    _read_array_data,
 )
 from dissect.cstruct.types.enum import EnumMetaType
 from dissect.cstruct.types.pointer import Pointer
@@ -637,7 +638,7 @@ class UnionMetaType(StructureMetaType):
             buf = stream
         else:
             offset = 0
-            buf = io.BytesIO(stream.read(cls.__size__))
+            buf = io.BytesIO(_read_array_data(stream, cls.__size__))
 
         for field in cls.__fields__:
             field_type = field.type
@@ -661,10 +662,10 @@ class UnionMetaType(StructureMetaType):
             result, sizes = cls._read_fields(stream, context=context, endian=endian)
             size = stream.tell() - start
             stream.seek(start)
-            buf = stream.read(size)
+            buf = _read_array_data(stream, size)
         elif "__init__" in cls.__dict__ and cls.__new__ is object.__new__:
             # Fast path for static unions
-            buf = stream.read(cls.__size__)
+            buf = _read_array_data(stream, cls.__size__)
             result, sizes = cls._read_fields(io.BytesIO(buf), endian=endian)
 
             obj: Union = object.__new__(cls)
@@ -677,7 +678,7 @@ class UnionMetaType(StructureMetaType):
         else:
             result = {}
             sizes = {}
-            buf = stream.read(cls.__size__)
+            buf = _read_array_data(stream, cls.__size__)
 
         # Create the object and set the values
         # Using type.__call__ directly calls the __init__ method of the class

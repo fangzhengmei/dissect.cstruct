@@ -4,7 +4,7 @@ import warnings
 from itertools import repeat
 from typing import TYPE_CHECKING, Any, BinaryIO, Generic, TypeVar
 
-from dissect.cstruct.types.base import EOF, BaseType, MetaType, _is_buffer_type
+from dissect.cstruct.types.base import EOF, BaseType, MetaType, _check_array_count, _is_buffer_type, _read_array_data
 from dissect.cstruct.util import _struct, classproperty
 
 if TYPE_CHECKING:
@@ -67,13 +67,18 @@ class Packed(BaseType, Generic[T], metaclass=PackedMetaType):
             length = len(data)
             count = length // cls.__size__
         else:
-            length = cls.__size__ * count
-            data = stream.read(length)
+            _check_array_count(count)
 
-        fmt = _struct(endian, f"{count}{cls.__fmt__}")
+            if count == 0:
+                return []
+
+            length = cls.__size__ * count
+            data = _read_array_data(stream, length)
 
         if len(data) != length:
             raise EOFError(f"Read {len(data)} bytes, but expected {length}")
+
+        fmt = _struct(endian, f"{count}{cls.__fmt__}")
 
         return list(map(cls.__new__, repeat(cls), fmt.unpack(data)))
 

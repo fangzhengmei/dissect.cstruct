@@ -337,7 +337,8 @@ def test_generate_fields_dynamic_after_bitfield(cs: cstruct, TestEnum: Enum, oth
     stream.seek(start + 3)
 
     values = {{'size': _value0, 'a': _value1, 'b': _value2}}
-    _count = max(0, int(_value0))
+    _count = _validate_array_count(int(_value0))
+    _check_array_budget(_count, _type5)
     _offset = stream.tell()
     _value3 = values['c'] = _type_call(_type4, _type5._read_array(stream, _count, context=values, endian=endian))
     sizes['c'] = stream.tell() - _offset
@@ -382,7 +383,8 @@ def test_generate_fields_dynamic_before_bitfield(cs: cstruct, TestEnum: Enum, ot
     stream.seek(start + 3)
 
     values = {{'size': _value0, 'a': _value1, 'b': _value2}}
-    _count = max(0, int(_value0))
+    _count = _validate_array_count(int(_value0))
+    _check_array_budget(_count, _type5)
     _offset = stream.tell()
     _value3 = values['c'] = _type_call(_type4, _type5._read_array(stream, _count, context=values, endian=endian))
     sizes['c'] = stream.tell() - _offset
@@ -419,16 +421,23 @@ def test_compiled_dynamic_array_sizes() -> None:
     # Integer fields read before are used directly, everything else is resolved like the interpreted version
     # The array with the size EOF is read by its type
     lines = source_lines(compiled.test)
-    assert [line for line in lines if line.startswith("_count = ") or "._read" in line] == [
-        "_count = max(0, int(_value0))",
+    # A dynamic array length is validated (non-negative integer) and budgeted before it is used to read
+    # anything, so a malformed length is rejected at this field's evidence offset on both paths
+    assert [line for line in lines if line.startswith(("_count = ", "_check_array_budget")) or "._read" in line] == [
+        "_count = _validate_array_count(int(_value0))",
+        "_check_array_budget(_count, _type4)",
         "_value3 = values['a'] = _type_call(_type3, _type4._read_array(stream, _count, context=values, endian=endian))",
-        "_count = max(0, (int(_value0) - _identifier(cs, values, 'HDR')))",
+        "_count = _validate_array_count((int(_value0) - _identifier(cs, values, 'HDR')))",
+        "_check_array_budget(_count, _type6)",
         "_value4 = values['b'] = _type_call(_type5, _type6._read_array(stream, _count, context=values, endian=endian))",
-        "_count = max(0, (int(_value1) * 2))",
+        "_count = _validate_array_count((int(_value1) * 2))",
+        "_check_array_budget(_count, _type8)",
         "_value5 = values['c'] = _type_call(_type7, _type8._read_array(stream, _count, context=values, endian=endian))",
-        "_count = max(0, _identifier(cs, values, 'hdr.size'))",
+        "_count = _validate_array_count(_identifier(cs, values, 'hdr.size'))",
+        "_check_array_budget(_count, _type0)",
         "_value6 = values['d'] = _type_call(_type9, _type0._read_array(stream, _count, context=values, endian=endian))",
-        "_count = max(0, (int(_value0) + _sizeof(cs, 'inner')))",
+        "_count = _validate_array_count((int(_value0) + _sizeof(cs, 'inner')))",
+        "_check_array_budget(_count, _type2)",
         "_value7 = values['e'] = _type_call(_type10, _type2._read_array("
         "stream, _count, context=values, endian=endian))",
         "_value8 = values['f'] = _type11._read(stream, context=values, endian=endian)",

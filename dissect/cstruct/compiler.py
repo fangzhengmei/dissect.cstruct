@@ -30,6 +30,7 @@ from dissect.cstruct.types import (
     Wchar,
     WcharArray,
 )
+from dissect.cstruct.types.base import READ_CHUNK_SIZE, _check_array_budget, _read_array_data, _validate_array_count
 from dissect.cstruct.types.enum import EnumMetaType
 from dissect.cstruct.types.structure import StructureMetaType, UnionMetaType, UnionProxy
 from dissect.cstruct.util import ENDIANNESS_TO_BYTEORDER_MAP, _struct
@@ -244,6 +245,9 @@ _GLOBALS = {
     "_field_bytes": _field_bytes,
     "_array_values": _array_values,
     "_or_default": _or_default,
+    "_validate_array_count": _validate_array_count,
+    "_check_array_budget": _check_array_budget,
+    "_read_array_data": _read_array_data,
     **SOURCE_GLOBALS,
 }
 
@@ -429,7 +433,7 @@ class _ReadSourceGenerator(_SourceGenerator):
 
         preamble = [
             f"if {' or '.join(checks)}: return _union_read(cls, stream, context=context, endian=endian)",
-            f"buf = stream.read({size})",
+            _read_source(size),
             _check_eof(size),
         ]
         code = indent("\n".join([*preamble, *lines, "return obj"]), "    ")
@@ -558,7 +562,11 @@ class _ReadSourceGenerator(_SourceGenerator):
             # Invalid expressions raise their error when reading the array
             return read
 
-        lines.append(f"_count = max(0, {count})")
+        # Validate the length before it is used to read or allocate anything, exactly like the
+        # interpreted reader does. This rejects negative or non-integer lengths at this field's
+        # evidence offset, and applies the same zero-width budget to both paths.
+        lines.append(f"_count = _validate_array_count({count})")
+        lines.append(f"_check_array_budget(_count, {self._type_symbol(field.type.__type__)})")
         element = self._type_symbol(field.type.__type__)
         return f"_type_call({type_}, {element}._read_array(stream, _count, context={context}, endian=endian))"
 
@@ -599,7 +607,7 @@ class _ReadSourceGenerator(_SourceGenerator):
         reads = []
         size = self._pack_fields(fields, 0, unpack, reads, self._assign_local)
 
-        lines = [f"buf = stream.read({size})", _check_eof(size)]
+        lines = [_read_source(size), _check_eof(size)]
         if unpack.has_values():
             lines.append(f"data = {self._add_symbol(unpack.functions('unpack'), 'unpack')}[endian](buf)")
 
@@ -658,7 +666,12 @@ class _ReadSourceGenerator(_SourceGenerator):
             if is_array:
                 read_type = _get_read_type(field_type.__type__)
 
-            if char == "x":
+            if is_array and count == 0:
+                # A zero-length array consumes no bytes and produces an empty value. Don't slice it
+                # out of the unpack variable, because a block with only zero-length fields has no
+                # values and never binds that variable, while the interpreted reader parses it.
+                getter = "b''"
+            elif char == "x":
                 # Byte based types are sliced directly out of the buffer, with the count in bytes
                 getter = f"buf[{offset}:{offset + count}]"
             elif is_array:
@@ -1255,6 +1268,19 @@ def _member_lookup(type_: str, value: str) -> str:
 def _check_eof(size: int) -> str:
     """Return the code to raise an ``EOFError`` if fewer than ``size`` bytes were read into ``buf``."""
     return f'if len(buf) != {size}: raise EOFError(f"Read {{len(buf)}} bytes, but expected {size}")'
+
+
+def _read_source(size: int) -> str:
+    """Return the code to read ``size`` bytes into ``buf``, without trusting the size.
+
+    A definition can declare a huge static array, and an untrusted length can make a dynamic field
+    read a huge block. Reading that many bytes in one call makes the stream allocate room for all of
+    them before it can know that the evidence holds them. The read is bounded and a short read is
+    rejected by :func:`_check_eof` at the evidence offset, exactly like any other truncation.
+    """
+    if size <= READ_CHUNK_SIZE:
+        return f"buf = stream.read({size})"
+    return f"buf = _read_array_data(stream, {size})"
 
 
 def _block(lines: list[str]) -> str:

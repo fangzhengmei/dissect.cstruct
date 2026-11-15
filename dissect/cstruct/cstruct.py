@@ -30,7 +30,7 @@ from dissect.cstruct.types import (
     Void,
     Wchar,
 )
-from dissect.cstruct.types.base import normalize_endianness
+from dissect.cstruct.types.base import _validate_array_count, normalize_endianness
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterable
@@ -537,6 +537,11 @@ class cstruct:
         else:
             if type_.__size__ is None:
                 raise ValueError(f"Cannot create array of dynamic type: {type_.__name__}")
+
+            # A static length is fixed in the definition, so an invalid one is rejected here instead
+            # of producing a type with a nonsensical size. This mirrors the runtime validation of
+            # dynamic lengths, so static, dynamic and nested arrays all share one length semantic.
+            num_entries = _validate_array_count(num_entries)
             size = num_entries * type_.__size__
 
         name = f"{type_.__name__}[]" if null_terminated else f"{type_.__name__}[{num_entries}]"

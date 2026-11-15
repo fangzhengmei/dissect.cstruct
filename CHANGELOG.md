@@ -42,6 +42,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A surrogate pair takes up two entries of a `wchar` array, so writing it no longer writes more bytes than the size of the array.
 - A `wchar` string can hold a lone surrogate, instead of raising an error for the whole structure when reading or writing it. Bytes are written back as they were stored.
 - Writing more than a single character to a `char` or `wchar` raises a `ValueError`, instead of writing all of it and moving the fields after it. An empty value is padded.
+- Array lengths from untrusted input can no longer amplify resources or cross the evidence boundary before failing:
+  - Every array length is validated before it is used to read or allocate anything. A negative or non-integer length raises an `ArraySizeError` at the array's evidence offset, on both the compiled and the interpreted path, instead of silently becoming an empty array.
+  - Arrays are read against the bytes the stream actually holds, in bounded chunks, so a huge declared length fails with an `EOFError` at the array's offset instead of pre-allocating the declared capacity or raising `MemoryError`/`OverflowError`.
+  - Element types that consume no bytes (an empty structure) get an explicit entry budget, because no amount of evidence can satisfy their declared length.
+  - A failed array read never returns a partially filled array as if it were complete, and leaves the stream where the truncation was detected so the next field is not read from a shifted offset.
+  - Compiled structures read a zero-length array like the interpreted reader, instead of raising a `NameError` for a block that has no values.
 
 ## [4.5] - 20-05-2025
 

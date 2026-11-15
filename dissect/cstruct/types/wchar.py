@@ -4,7 +4,15 @@ import sys
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
 from dissect.cstruct.exception import ArraySizeError
-from dissect.cstruct.types.base import EOF, BaseArray, BaseType, _is_seekable, _read_null_terminated
+from dissect.cstruct.types.base import (
+    EOF,
+    BaseArray,
+    BaseType,
+    _check_array_count,
+    _is_seekable,
+    _read_array_data,
+    _read_null_terminated,
+)
 
 if TYPE_CHECKING:
     from dissect.cstruct.cstruct import Endianness
@@ -69,10 +77,12 @@ class Wchar(str, BaseType):
         if count == 0:
             return type.__call__(cls, "")
 
+        _check_array_count(count)
+
         if count != EOF:
             count *= 2
 
-        data = stream.read(-1 if count == EOF else count)
+        data = _read_array_data(stream, -1 if count == EOF else count)
         if count != EOF and len(data) != count:
             raise EOFError(f"Read {len(data)} bytes, but expected {count}")
 

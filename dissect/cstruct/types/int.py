@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, BinaryIO
 
-from dissect.cstruct.types.base import EOF, BaseType, MetaType
+from dissect.cstruct.types.base import EOF, BaseType, MetaType, _check_array_count, _read_array_data
 from dissect.cstruct.util import ENDIANNESS_TO_BYTEORDER_MAP
 
 if TYPE_CHECKING:
@@ -32,9 +32,14 @@ class Int(int, BaseType):
         if count == EOF:
             return MetaType._read_array(cls, stream, count, context=context, endian=endian)
 
+        _check_array_count(count)
+
+        if count == 0:
+            return []
+
         size = cls.__size__
         length = size * count
-        data = stream.read(length)
+        data = _read_array_data(stream, length)
         if len(data) != length:
             raise EOFError(f"Read {len(data) % size} bytes, but expected {size}")
 
