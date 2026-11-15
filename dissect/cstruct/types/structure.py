@@ -19,6 +19,7 @@ from dissect.cstruct.lexer import IDENTIFIER_TYPES
 from dissect.cstruct.types.base import (
     _BUFFER_TYPES,
     _IMMUTABLE_TYPES,
+    _PARSE_KWARGS,
     BaseArray,
     BaseType,
     MetaType,
@@ -77,13 +78,33 @@ class StructureMetaType(MetaType):
 
     def __call__(cls, *args, **kwargs) -> Self:  # type: ignore
         if len(args) == 1 and not kwargs:
-            # Fast paths for the most common cases
+            # Fast path for the most common cases
             obj = args[0]
+            cs = cls.__cs__
+
             if type(obj) in _BUFFER_TYPES:
-                return cls._read(io.BytesIO(obj), endian=cls.__cs__.endian)
+                if not cs._dereference_limits:
+                    return cls._read(io.BytesIO(obj), endian=cs.endian)
+
+                # Dispatches to ``cls.reads``, which starts a resolution for pointer dereferences
+                return cls.reads(obj)
 
             if hasattr(obj, "read") and not isinstance(obj, cls):
-                return cls._read(obj, endian=cls.__cs__.endian)
+                if not cs._dereference_limits:
+                    return cls._read(obj, endian=cs.endian)
+
+                # Dispatches to ``cls.read``, which starts a resolution for pointer dereferences
+                return cls.read(obj)
+
+        elif len(args) == 1 and not (set(kwargs) - _PARSE_KWARGS) and not isinstance(obj := args[0], cls):
+            # Parsing with options for pointer dereferences
+            parse_kwargs = {key: value for key, value in kwargs.items() if key in _PARSE_KWARGS}
+
+            if _is_buffer_type(obj):
+                return cls.reads(obj, **parse_kwargs)
+
+            if hasattr(obj, "read"):
+                return cls.read(obj, **parse_kwargs)
 
         if not args and not kwargs:
             obj = type.__call__(cls)
@@ -585,7 +606,10 @@ class UnionMetaType(StructureMetaType):
             object.__setattr__(obj, "_endian", cls.__cs__.endian)
 
         # Calling with non-stream args or kwargs means we are initializing with values
-        if (args and not (len(args) == 1 and (hasattr(args[0], "read") or _is_buffer_type(args[0])))) or kwargs:
+        # Keyword arguments that only configure parsing (e.g. ``read_window``) are not field values
+        if (args and not (len(args) == 1 and (hasattr(args[0], "read") or _is_buffer_type(args[0])))) or any(
+            name in cls.__lookup__ for name in kwargs
+        ):
             # We don't support user initialization of dynamic unions yet
             if cls.__dynamic__:
                 raise NotImplementedError("Initializing a dynamic union is not yet supported")

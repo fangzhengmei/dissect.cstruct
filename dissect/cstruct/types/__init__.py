@@ -8,6 +8,7 @@ from dissect.cstruct.types.int import Int
 from dissect.cstruct.types.leb128 import LEB128
 from dissect.cstruct.types.packed import Packed
 from dissect.cstruct.types.pointer import Pointer
+from dissect.cstruct.types.state import DereferenceBudget, DereferenceResult, PointerWindow
 from dissect.cstruct.types.structure import Field, Structure, Union
 from dissect.cstruct.types.void import Void, VoidArray
 from dissect.cstruct.types.wchar import Wchar, WcharArray
@@ -19,6 +20,8 @@ __all__ = [
     "BaseType",
     "Char",
     "CharArray",
+    "DereferenceBudget",
+    "DereferenceResult",
     "Enum",
     "Field",
     "Flag",
@@ -26,6 +29,7 @@ __all__ = [
     "MetaType",
     "Packed",
     "Pointer",
+    "PointerWindow",
     "Structure",
     "Union",
     "Void",

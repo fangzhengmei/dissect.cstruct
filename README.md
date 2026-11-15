@@ -261,6 +261,51 @@ assert a.dumps() == d
 ### Enums and Flags
 The API to access enum and flag members and their values in the same way as the native Enum types in Python 3. Functionally, it's best comparable to the IntEnum or IntFlag type.
 
+### Pointer read windows and dereference budgets
+Following a pointer chain can end up anywhere in a stream, or never end at all when the data contains a cycle. To keep a parse within the evidence that you trust, you can restrict pointer dereferences with a read window and a dereference budget:
+
+```python
+from dissect.cstruct import cstruct
+
+cdef = """
+struct node {
+    uint32  value;
+    node    *next;
+};
+"""
+
+cs = cstruct(pointer="uint32").load(cdef)
+
+# node @ 0x00 -> 0x08 -> 0x10 -> 0x18 -> 0x18, with values 1, 2, 3 and 4
+data = (
+    b"\x01\x00\x00\x00\x08\x00\x00\x00"
+    b"\x02\x00\x00\x00\x10\x00\x00\x00"
+    b"\x03\x00\x00\x00\x18\x00\x00\x00"
+    b"\x04\x00\x00\x00\x18\x00\x00\x00"
+)
+obj = cs.node(data)
+
+# A window limits the stream offsets that pointer dereferences may visit
+cs.read_window = (0, len(data))
+assert obj.next.dereference().next.dereference().value == 3
+
+# A window that doesn't cover the fourth node rejects the dereference that would read it
+cs.read_window = (0, 0x18)
+assert obj.next.dereference().next.dereference().next.try_dereference().reason == "out_of_window"
+
+# A budget limits how many dereferences a single resolution may trace
+cs.read_window = None
+cs.dereference_budget = 2
+assert obj.next.dereference().next.dereference().value == 3
+assert obj.next.dereference().next.dereference().next.try_dereference().reason == "budget_exceeded"
+
+# Both can also be given per parse
+obj = cs.node.reads(data, read_window=(0, len(data)), dereference_budget=2)
+assert obj.next.dereference().next.dereference().value == 3
+```
+
+A rejected dereference raises a `PointerDereferenceError` subclass, or returns a `DereferenceResult` from `try_dereference`, with a stable `reason` that tells a null pointer (`null_pointer`), a negative address (`negative_address`), an address outside of the window (`out_of_window`), an exhausted budget (`budget_exceeded`) and a cyclic chain (`cycle`) apart. The stream position is restored either way. Use `dereference_budget=None` and `read_window=None` (the default) to keep the unrestricted behavior.
+
 ### Custom types
 You can implement your own types by subclassing `BaseType`, and adding them to your cstruct instance with `add_custom_type(name, type, size, alignment, ...)`
 

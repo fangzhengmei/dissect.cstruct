@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, TypeVar
 
 from dissect.cstruct.exception import ArraySizeError
 from dissect.cstruct.expression import Expression
+from dissect.cstruct.types.state import _UNSET, enter_parse, exit_parse
 from dissect.cstruct.util import classproperty, normalize_endianness
 
 if TYPE_CHECKING:
@@ -16,12 +17,16 @@ if TYPE_CHECKING:
 
     from typing_extensions import Self
 
-    from dissect.cstruct.cstruct import AllowedEndianness, Endianness, cstruct
+    from dissect.cstruct.cstruct import AllowedEndianness, Endianness, ReadWindow, cstruct
+    from dissect.cstruct.types.state import DereferenceBudget
 
 
 EOF = -0xE0F  # Negative counts are illegal anyway, so abuse that for our EOF sentinel
 
 _IMMUTABLE_TYPES = (int, float, bytes, str)
+
+# Keyword arguments that configure how a parse handles pointer dereferences
+_PARSE_KWARGS = frozenset({"endian", "read_window", "dereference_budget"})
 
 
 class MetaType(type):
@@ -45,32 +50,43 @@ class MetaType(type):
         if len(args) == 1 and not kwargs:
             # Fast path for the most common case without keyword arguments
             obj = args[0]
+            cs = cls.__cs__
+
             if type(obj) in _BUFFER_TYPES:
                 if len(obj) == cls.__size__ and isinstance(obj, bytes) and issubclass(cls, bytes):
                     # Shortcut for char/bytes type
                     return type.__call__(cls, obj)
-                return cls._read(BytesIO(obj), endian=cls.__cs__.endian)
+
+                if not cs._dereference_limits:
+                    # Without limits to set up, there's no need to go through ``reads``
+                    return cls._read(BytesIO(obj), endian=cs.endian)
+
+                # Dispatches to ``cls.reads``, which starts a resolution for pointer dereferences
+                return cls.reads(obj)
 
             if hasattr(obj, "read") and not isinstance(obj, cls):
-                return cls._read(obj, endian=cls.__cs__.endian)
+                if not cs._dereference_limits:
+                    return cls._read(obj, endian=cs.endian)
+
+                # Dispatches to ``cls.read``, which starts a resolution for pointer dereferences
+                return cls.read(obj)
 
             if not _is_buffer_type(obj):
                 # E.g. initializing with a value
                 return type.__call__(cls, obj)
 
-        if len(args) == 1 and not isinstance(obj := args[0], cls):
+        if len(args) == 1 and not (set(kwargs) - _PARSE_KWARGS) and not isinstance(obj := args[0], cls):
+            parse_kwargs = {key: value for key, value in kwargs.items() if key in _PARSE_KWARGS}
+
             if type(obj) not in _BUFFER_TYPES and hasattr(obj, "read"):
-                endian = (
-                    normalize_endianness(endian) if (endian := kwargs.get("endian")) is not None else cls.__cs__.endian
-                )
-                return cls._read(obj, endian=endian)
+                return cls.read(obj, **parse_kwargs)
 
             if isinstance(obj, bytes) and len(obj) == cls.__size__ and issubclass(cls, bytes):
                 # Shortcut for char/bytes type
                 return type.__call__(cls, *args, **kwargs)
 
             if _is_buffer_type(obj):
-                return cls.reads(obj, endian=kwargs.get("endian"))
+                return cls.reads(obj, **parse_kwargs)
 
         return type.__call__(cls, *args, **kwargs)
 
@@ -98,39 +114,79 @@ class MetaType(type):
         """Return the default value of this type."""
         return cls()
 
-    def reads(cls, data: bytes | memoryview | bytearray, *, endian: AllowedEndianness | None = None) -> Self:  # type: ignore
+    def reads(  # type: ignore
+        cls,
+        data: bytes | memoryview | bytearray,
+        *,
+        endian: AllowedEndianness | None = None,
+        read_window: ReadWindow | None | object = _UNSET,
+        dereference_budget: DereferenceBudget | int | None | object = _UNSET,
+    ) -> Self:
         """Parse the given data from a bytes-like object.
 
         Args:
             data: Bytes-like object to parse.
             endian: The endianness to use when parsing (little, big, network, <, >, !, @ or =).
                     When omitted, the cstruct instance's current endianness is used.
+            read_window: Optional window that limits the stream offsets pointer dereferences of this parse may
+                    visit. Defaults to the ``read_window`` of the cstruct instance.
+            dereference_budget: Optional budget for the amount of pointer dereferences this parse may trace.
+                    Defaults to the ``dereference_budget`` of the cstruct instance.
 
         Returns:
             The parsed value of this type.
         """
         endian = normalize_endianness(endian) if endian is not None else cls.__cs__.endian
-        return cls._read(BytesIO(data), endian=endian)
 
-    def read(cls, obj: BinaryIO | bytes | memoryview | bytearray, *, endian: AllowedEndianness | None = None) -> Self:  # type: ignore
+        if not cls.__cs__._dereference_limits and read_window is _UNSET and dereference_budget is _UNSET:
+            # No limits to set up, so pointers keep their unrestricted behavior
+            return cls._read(BytesIO(data), endian=endian)
+
+        token = enter_parse(cls.__cs__, read_window, dereference_budget)
+        try:
+            return cls._read(BytesIO(data), endian=endian)
+        finally:
+            exit_parse(token)
+
+    def read(  # type: ignore
+        cls,
+        obj: BinaryIO | bytes | memoryview | bytearray,
+        *,
+        endian: AllowedEndianness | None = None,
+        read_window: ReadWindow | None | object = _UNSET,
+        dereference_budget: DereferenceBudget | int | None | object = _UNSET,
+    ) -> Self:
         """Parse the given data.
 
         Args:
             obj: Data to parse. Can be a bytes-like object or a file-like object.
             endian: The endianness to use when parsing (little, big, network, <, >, !, @ or =).
                     When omitted, the cstruct instance's current endianness is used.
+            read_window: Optional window that limits the stream offsets pointer dereferences of this parse may
+                    visit. Defaults to the ``read_window`` of the cstruct instance.
+            dereference_budget: Optional budget for the amount of pointer dereferences this parse may trace.
+                    Defaults to the ``dereference_budget`` of the cstruct instance.
 
         Returns:
             The parsed value of this type.
         """
         if _is_buffer_type(obj):
-            return cls.reads(obj, endian=endian)
+            return cls.reads(obj, endian=endian, read_window=read_window, dereference_budget=dereference_budget)
 
         if not hasattr(obj, "read"):
             raise TypeError("Invalid object type")
 
         endian = normalize_endianness(endian) if endian is not None else cls.__cs__.endian
-        return cls._read(obj, endian=endian)
+
+        if not cls.__cs__._dereference_limits and read_window is _UNSET and dereference_budget is _UNSET:
+            # No limits to set up, so pointers keep their unrestricted behavior
+            return cls._read(obj, endian=endian)
+
+        token = enter_parse(cls.__cs__, read_window, dereference_budget)
+        try:
+            return cls._read(obj, endian=endian)
+        finally:
+            exit_parse(token)
 
     def write(cls, stream: BinaryIO, value: Any, *, endian: AllowedEndianness | None = None) -> int:
         """Write a value to a writable file-like object.

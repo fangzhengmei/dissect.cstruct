@@ -9,6 +9,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - Declarative syntax for structures and unions in `dissect.cstruct.declarative`, using classes with type annotations.
+- Optional read window and dereference budget for pointer dereferences, configured with `cstruct(read_window=..., dereference_budget=...)`, the `read_window` and `dereference_budget` attributes of a `cstruct` instance, or per `read`/`reads`/`dereference` call:
+  - A `PointerWindow` restricts which stream offsets pointer dereferences may visit. Both the address of a pointer and the value that is read through it have to be fully inside the window, otherwise the dereference is rejected.
+  - A `DereferenceBudget` limits how many dereferences a single resolution (a parse, or the walk of a pointer chain) may trace. Every pointer that is created during that resolution shares the budget.
+  - Rejected dereferences raise a `PointerDereferenceError` subclass (`NullPointerDereference`, `NegativePointerAddress`, `PointerOutOfWindow`, `DereferenceBudgetExceeded` and `PointerCycleError`) with a stable `reason`, or return a `DereferenceResult` through `Pointer.try_dereference`. The stream position is restored either way.
+  - Multiple pointers that point to the same object resolve to the same value, so a legitimately shared object doesn't exhaust the budget.
 
 ### Changed
 

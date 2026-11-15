@@ -31,6 +31,7 @@ from dissect.cstruct.types import (
     Wchar,
 )
 from dissect.cstruct.types.base import normalize_endianness
+from dissect.cstruct.types.state import _UNSET, as_budget, as_window
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterable
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
         Array,
         Field,
     )
+    from dissect.cstruct.types.state import DereferenceBudget, PointerWindow, ReadWindow
 
 
 T = TypeVar("T", bound=BaseType)
@@ -54,13 +56,31 @@ class cstruct:
     Args:
         endian: The endianness to use when parsing (little, big, network, <, >, !, @ or =).
         pointer: The pointer type to use for pointers.
+        read_window: Optional default window that limits the stream offsets pointer dereferences may visit.
+        dereference_budget: Optional default budget for the amount of pointer dereferences a parse may trace.
     """
 
     DEF_CSTYLE = 1
     DEF_LEGACY = 2
 
-    def __init__(self, load: str = "", *, endian: AllowedEndianness = "<", pointer: str | None = None):
+    # Internal defaults, so an instance that doesn't call ``__init__`` still behaves like an unrestricted one
+    _read_window: PointerWindow | None = None
+    _dereference_budget: DereferenceBudget | None = None
+    _dereference_limits: bool = False
+
+    def __init__(
+        self,
+        load: str = "",
+        *,
+        endian: AllowedEndianness = "<",
+        pointer: str | None = None,
+        read_window: ReadWindow | None = None,
+        dereference_budget: DereferenceBudget | int | None = None,
+    ):
         self.endian = normalize_endianness(endian)
+        self._read_window = as_window(read_window)
+        self._dereference_budget = as_budget(dereference_budget)
+        self._dereference_limits = self._read_window is not None or self._dereference_budget is not None
 
         self.consts: dict[str, int | str | bytes] = {}
         self.types: dict[str, type[BaseType]] = {}
@@ -210,6 +230,26 @@ class cstruct:
         if load:
             self.load(load)
 
+    @property
+    def read_window(self) -> PointerWindow | None:
+        """The default window that limits the stream offsets pointer dereferences may visit."""
+        return self._read_window
+
+    @read_window.setter
+    def read_window(self, value: ReadWindow | None) -> None:
+        self._read_window = as_window(value)
+        self._dereference_limits = self._read_window is not None or self._dereference_budget is not None
+
+    @property
+    def dereference_budget(self) -> DereferenceBudget | None:
+        """The default budget for the amount of pointer dereferences a parse may trace."""
+        return self._dereference_budget
+
+    @dereference_budget.setter
+    def dereference_budget(self, value: DereferenceBudget | int | None) -> None:
+        self._dereference_budget = as_budget(value)
+        self._dereference_limits = self._read_window is not None or self._dereference_budget is not None
+
     def __getattr__(
         self, attr: str
     ) -> (
@@ -245,7 +285,12 @@ class cstruct:
         raise AttributeError(f"'{type(self).__name__}' object has no attribute {attr!r}")
 
     def __copy__(self) -> cstruct:
-        cs = cstruct(endian=self.endian, pointer=self.pointer.__name__)
+        cs = cstruct(
+            endian=self.endian,
+            pointer=self.pointer.__name__,
+            read_window=self.read_window,
+            dereference_budget=self.dereference_budget,
+        )
         cs._anonymous_count = self._anonymous_count
         cs.includes = self.includes.copy()
 
@@ -427,17 +472,28 @@ class cstruct:
 
         return "\n\n".join(blocks)
 
-    def read(self, name: str, stream: BinaryIO) -> Any:
+    def read(
+        self,
+        name: str,
+        stream: BinaryIO,
+        *,
+        read_window: ReadWindow | None | object = _UNSET,
+        dereference_budget: DereferenceBudget | int | None | object = _UNSET,
+    ) -> Any:
         """Parse data using a given type.
 
         Args:
             name: Type name to read.
             stream: File-like object or byte string to parse.
+            read_window: Optional window that limits the stream offsets pointer dereferences of this parse may
+                    visit. Defaults to ``read_window`` of this instance.
+            dereference_budget: Optional budget for the amount of pointer dereferences this parse may trace.
+                    Defaults to ``dereference_budget`` of this instance.
 
         Returns:
             The parsed data.
         """
-        return self.resolve(name).read(stream)
+        return self.resolve(name).read(stream, read_window=read_window, dereference_budget=dereference_budget)
 
     def resolve(self, name: type[BaseType] | str) -> type[BaseType]:
         """Resolve a type name to get the actual type object.
@@ -768,7 +824,12 @@ _RESERVED_NAMES = frozenset(dir(cstruct)) | {
     "types",
     "includes",
     "pointer",
+    "read_window",
+    "dereference_budget",
     "_anonymous_count",
+    "_read_window",
+    "_dereference_budget",
+    "_dereference_limits",
 }
 
 
