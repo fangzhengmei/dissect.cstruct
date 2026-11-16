@@ -31,6 +31,7 @@ from dissect.cstruct.types import (
     Wchar,
 )
 from dissect.cstruct.types.base import normalize_endianness
+from dissect.cstruct.types.pointer import new_pointer_resolver
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterable
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
         Array,
         Field,
     )
+    from dissect.cstruct.types.pointer import _PointerResolver
 
 
 T = TypeVar("T", bound=BaseType)
@@ -59,12 +61,24 @@ class cstruct:
     DEF_CSTYLE = 1
     DEF_LEGACY = 2
 
-    def __init__(self, load: str = "", *, endian: AllowedEndianness = "<", pointer: str | None = None):
+    def __init__(
+        self,
+        load: str = "",
+        *,
+        endian: AllowedEndianness = "<",
+        pointer: str | None = None,
+        pointer_window: tuple[int, int] | None = None,
+        pointer_budget: int | None = None,
+    ):
         self.endian = normalize_endianness(endian)
 
         self.consts: dict[str, int | str | bytes] = {}
         self.types: dict[str, type[BaseType]] = {}
         self.includes: list[str] = []
+
+        # Optional limits for pointer chain resolution
+        self.pointer_window = self._normalize_pointer_window(pointer_window)
+        self.pointer_budget = self._normalize_pointer_budget(pointer_budget)
 
         # fmt: off
         initial_types = {
@@ -245,7 +259,12 @@ class cstruct:
         raise AttributeError(f"'{type(self).__name__}' object has no attribute {attr!r}")
 
     def __copy__(self) -> cstruct:
-        cs = cstruct(endian=self.endian, pointer=self.pointer.__name__)
+        cs = cstruct(
+            endian=self.endian,
+            pointer=self.pointer.__name__,
+            pointer_window=self.pointer_window,
+            pointer_budget=self.pointer_budget,
+        )
         cs._anonymous_count = self._anonymous_count
         cs.includes = self.includes.copy()
 
@@ -491,6 +510,60 @@ class cstruct:
         """Context manager for temporarily changing the endianness to little endian."""
         with self.endianness("<") as cs:
             yield cs
+
+    @staticmethod
+    def _normalize_pointer_window(window: tuple[int, int] | None) -> tuple[int, int] | None:
+        """Validate a pointer read window of the form ``(start_offset, end_offset)``."""
+        if window is None:
+            return None
+
+        start, end = window
+        if start < 0:
+            raise ValueError(f"Pointer window start must not be negative, got {start}")
+        if end < start:
+            raise ValueError(f"Pointer window end ({end}) must not be before its start ({start})")
+        return int(start), int(end)
+
+    @staticmethod
+    def _normalize_pointer_budget(budget: int | None) -> int | None:
+        """Validate a pointer dereference budget."""
+        if budget is None:
+            return None
+        if budget < 0:
+            raise ValueError(f"Pointer dereference budget must not be negative, got {budget}")
+        return int(budget)
+
+    def new_pointer_resolver(self) -> _PointerResolver | None:
+        """Create a fresh pointer resolver from the currently configured limits, or ``None`` if there are none."""
+        return new_pointer_resolver(self.pointer_window, self.pointer_budget)
+
+    @contextmanager
+    def pointer_limits(
+        self,
+        *,
+        window: tuple[int, int] | None = None,
+        budget: int | None = None,
+    ) -> Generator[cstruct]:
+        """Context manager for temporarily setting the pointer read window and/or dereference budget.
+
+        A ``None`` argument leaves the corresponding limit unchanged. The previous values are restored
+        when the context manager exits.
+
+        Args:
+            window: Optional ``(start_offset, end_offset)`` range that pointer targets must fall within.
+            budget: Optional maximum number of dereferences per pointer graph resolution.
+        """
+        original_window = self.pointer_window
+        original_budget = self.pointer_budget
+        if window is not None:
+            self.pointer_window = self._normalize_pointer_window(window)
+        if budget is not None:
+            self.pointer_budget = self._normalize_pointer_budget(budget)
+        try:
+            yield self
+        finally:
+            self.pointer_window = original_window
+            self.pointer_budget = original_budget
 
     def _make_type(
         self,

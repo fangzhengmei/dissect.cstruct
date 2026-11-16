@@ -7,6 +7,10 @@ from dissect.cstruct.exception import (
     Error,
     NullPointerDereference,
     ParserError,
+    PointerBudgetExceeded,
+    PointerCycleError,
+    PointerError,
+    PointerWindowError,
     ResolveError,
 )
 from dissect.cstruct.expression import Expression
@@ -70,6 +74,10 @@ __all__ = [
     "Packed",
     "ParserError",
     "Pointer",
+    "PointerBudgetExceeded",
+    "PointerCycleError",
+    "PointerError",
+    "PointerWindowError",
     "ResolveError",
     "Structure",
     "Union",

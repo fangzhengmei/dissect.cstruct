@@ -25,7 +25,7 @@ from dissect.cstruct.types.base import (
     _is_buffer_type,
 )
 from dissect.cstruct.types.enum import EnumMetaType
-from dissect.cstruct.types.pointer import Pointer
+from dissect.cstruct.types.pointer import RESOLVER_CONTEXT_KEY, Pointer
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from typing_extensions import Self
 
     from dissect.cstruct.cstruct import Endianness
+    from dissect.cstruct.types.pointer import _PointerResolver
 
 
 class Field:
@@ -238,12 +239,34 @@ class StructureMetaType(MetaType):
         # The structure size is whatever the currently calculated offset is
         return offset, alignment
 
+    def _pointer_resolver(cls, context: dict[str, Any] | None) -> _PointerResolver | None:
+        """Return the resolver of the enclosing parse, or a new one from the cstruct pointer limits.
+
+        Returns ``None`` when no pointer limits are configured, so parses without limits pay no extra cost.
+        """
+        resolver = context.get(RESOLVER_CONTEXT_KEY) if context else None
+        if resolver is None and (
+            cls.__cs__.pointer_window is not None or cls.__cs__.pointer_budget is not None
+        ):
+            resolver = cls.__cs__.new_pointer_resolver()
+        return resolver
+
     def _read(cls, stream: BinaryIO, *, context: dict[str, Any] | None = None, endian: Endianness) -> Self:  # type: ignore
         bit_buffer = None
         struct_start = stream.tell()
 
+        # Reuse the resolver of the enclosing parse, or start one from the cstruct pointer limits.
+        # The cheap guard keeps the common case without pointer limits free of extra method calls.
+        resolver = context.get(RESOLVER_CONTEXT_KEY) if context else None
+        if resolver is None and (
+            cls.__cs__.pointer_window is not None or cls.__cs__.pointer_budget is not None
+        ):
+            resolver = cls.__cs__.new_pointer_resolver()
+
         result = {}
         sizes = {}
+        if resolver is not None:
+            result[RESOLVER_CONTEXT_KEY] = resolver
         for field in cls.__fields__:
             offset = stream.tell()
 
@@ -284,6 +307,8 @@ class StructureMetaType(MetaType):
 
         # Using type.__call__ directly calls the __init__ method of the class
         # This is faster than calling cls() and bypasses the metaclass __call__ method
+        if resolver is not None:
+            result.pop(RESOLVER_CONTEXT_KEY, None)
         obj = type.__call__(cls, **result)
         obj.__dynamic_sizes__ = sizes
         return obj
@@ -632,6 +657,11 @@ class UnionMetaType(StructureMetaType):
         result = {}
         sizes = {}
 
+        # Reuse the resolver of the enclosing parse, or start a new one from the cstruct pointer limits
+        resolver = cls._pointer_resolver(context)
+        if resolver is not None:
+            result[RESOLVER_CONTEXT_KEY] = resolver
+
         if cls.__size__ is None:
             offset = stream.tell()
             buf = stream
@@ -656,6 +686,11 @@ class UnionMetaType(StructureMetaType):
         return result, sizes
 
     def _read(cls, stream: BinaryIO, *, context: dict[str, Any] | None = None, endian: Endianness) -> Self:  # type: ignore
+        # Reuse the resolver of the enclosing parse, or start a new one from the cstruct pointer limits
+        resolver = cls._pointer_resolver(context)
+        if resolver is not None:
+            context = {**(context or {}), RESOLVER_CONTEXT_KEY: resolver}
+
         if cls.__size__ is None:
             start = stream.tell()
             result, sizes = cls._read_fields(stream, context=context, endian=endian)
@@ -665,8 +700,10 @@ class UnionMetaType(StructureMetaType):
         elif "__init__" in cls.__dict__ and cls.__new__ is object.__new__:
             # Fast path for static unions
             buf = stream.read(cls.__size__)
-            result, sizes = cls._read_fields(io.BytesIO(buf), endian=endian)
+            result, sizes = cls._read_fields(io.BytesIO(buf), context=context, endian=endian)
 
+            if resolver is not None:
+                result.pop(RESOLVER_CONTEXT_KEY, None)
             obj: Union = object.__new__(cls)
             obj.__dict__.update(result)
             object.__setattr__(obj, "__dynamic_sizes__", sizes)
@@ -684,6 +721,8 @@ class UnionMetaType(StructureMetaType):
         # This is faster than calling cls() and bypasses the metaclass __call__ method
         # It also makes it easier to differentiate between user-initialization of the class
         # and initialization from a stream read
+        if resolver is not None:
+            result.pop(RESOLVER_CONTEXT_KEY, None)
         obj: Union = type.__call__(cls, **result)
         object.__setattr__(obj, "__dynamic_sizes__", sizes)
         object.__setattr__(obj, "_buf", buf)

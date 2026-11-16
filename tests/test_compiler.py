@@ -206,7 +206,7 @@ def test_generate_packed_read_composite_types(cs: cstruct, TestEnum: type[Enum])
     _enum_value = data[0]
     if (_member := _type0._value2member_map_.get(_enum_value)) is None: _member = _type_call(_type0, _enum_value)
     _value0 = _member
-    values = {'a': _value0}
+    values = {**(context or {}), 'a': _value0}
     _value1 = values['b'] = _type1.__new__(_type1, data[1], stream, context=values, endian=endian)
     _value2 = values['c'] = _type_call(_type2, list(map(_type_call, _repeat(_type0), data[2:4])))
     """

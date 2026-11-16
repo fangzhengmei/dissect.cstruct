@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - Declarative syntax for structures and unions in `dissect.cstruct.declarative`, using classes with type annotations.
+- Optional pointer read window (`pointer_window`) and dereference budget (`pointer_budget`) on the `cstruct` class,
+  including a `pointer_limits` context manager. They bound pointer chain resolution: targets outside the window
+  (including negative offsets) raise `PointerWindowError`, chains longer than the budget raise
+  `PointerBudgetExceeded`, and nested cycles raise `PointerCycleError`. Rejections restore the stream position and
+  return distinguishable errors, while pointers sharing an in-window target keep resolving to the same object. Both
+  the interpreted and compiled readers enforce the same constraints.
 
 ### Changed
 

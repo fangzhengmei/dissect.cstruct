@@ -31,6 +31,7 @@ from dissect.cstruct.types import (
     WcharArray,
 )
 from dissect.cstruct.types.enum import EnumMetaType
+from dissect.cstruct.types.pointer import RESOLVER_CONTEXT_KEY
 from dissect.cstruct.types.structure import StructureMetaType, UnionMetaType, UnionProxy
 from dissect.cstruct.util import ENDIANNESS_TO_BYTEORDER_MAP, _struct
 
@@ -244,6 +245,7 @@ _GLOBALS = {
     "_field_bytes": _field_bytes,
     "_array_values": _array_values,
     "_or_default": _or_default,
+    "_resolver_context_key": RESOLVER_CONTEXT_KEY,
     **SOURCE_GLOBALS,
 }
 
@@ -346,13 +348,19 @@ class _ReadSourceGenerator(_SourceGenerator):
         self._has_context = False
         self._uses_start = False
         self._uses_sizes = False
+        self._uses_resolver = _has_pointer_field(fields)
 
     def _context(self, lines: list[str]) -> str:
         """Return the name of the context dictionary, creating it from the fields read so far if needed."""
         if not self._has_context:
             self._has_context = True
             items = ", ".join(f"{name!r}: {var}" for name, var in self._assigned)
-            lines.append(f"values = {{{items}}}")
+            if self._uses_resolver:
+                # Preserve the enclosing context (which carries the pointer resolver) and add the new fields
+                prefix = f"**(context or {{}}){', ' if items else ''}"
+                lines.append(f"values = {{{prefix}{items}}}")
+            else:
+                lines.append(f"values = {{{items}}}")
 
         return "values"
 
@@ -382,6 +390,12 @@ class _ReadSourceGenerator(_SourceGenerator):
         if checks := self._modified_checks():
             # Fall back to the non-inlined version if any of the inlined types was modified after compilation
             preamble.append(f"if {' or '.join(checks)}: return {self._fallback()}(cls, stream, context, endian)")
+        if self._uses_resolver:
+            # Reuse the resolver of an enclosing parse, or start one from the cstruct pointer limits
+            preamble.append(
+                "_resolver = (context or {}).get(_resolver_context_key) or cs.new_pointer_resolver()"
+            )
+            preamble.append("if _resolver is not None: context = {**(context or {}), _resolver_context_key: _resolver}")
         if self._uses_sizes:
             preamble.append("sizes = {}")
         if self._uses_start:
@@ -1347,3 +1361,23 @@ def _get_read_type(type_: type[BaseType]) -> type[BaseType]:
         type_ = type_.__cs__.pointer
 
     return type_
+
+
+def _has_pointer_field(fields: list[Field]) -> bool:
+    """Return whether any of the given fields is a pointer or an array of pointers."""
+    for field in fields:
+        field_type = field.type
+        if not isinstance(field_type, type):
+            # E.g. a mock type used while testing the code generator
+            continue
+
+        if isinstance(field_type, EnumMetaType):
+            field_type = field_type.__type__
+
+        while isinstance(field_type, type) and issubclass(field_type, BaseArray):
+            field_type = field_type.__type__
+
+        if isinstance(field_type, type) and issubclass(field_type, Pointer):
+            return True
+
+    return False
