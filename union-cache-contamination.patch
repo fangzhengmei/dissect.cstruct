@@ -1,0 +1,239 @@
+diff --git a/dissect/cstruct/compiler.py b/dissect/cstruct/compiler.py
+index a8228b8..0da2cea 100644
+--- a/dissect/cstruct/compiler.py
++++ b/dissect/cstruct/compiler.py
+@@ -192,10 +192,14 @@ class _Fallback:
+         self.cls = cls
+         self.fields = list(fields)
+         self.func = None
++        # The generation of the layout this function was generated for, so a later mutation cannot keep using it
++        self.generation: int | None = None
+ 
+     def __call__(self, cls: type[Structure], stream: BinaryIO, context: dict[str, Any] | None, endian: str) -> Any:
+-        if self.func is None:
++        generation = self.cls.__layout_generation__
++        if self.func is None or self.generation != generation:
+             self.func = _ReadSourceGenerator(self.cls, self.fields, inline=False).generate().__func__
++            self.generation = generation
+         return self.func(cls, stream, context=context, endian=endian)
+ 
+ 
+@@ -237,6 +241,7 @@ _GLOBALS = {
+     "_object_setattr": object.__setattr__,
+     "_getattr": getattr,
+     "_UnionProxy": UnionProxy,
++    "_struct_read": StructureMetaType._read,
+     "_union_read": UnionMetaType._read,
+     "_struct_write": StructureMetaType._write,
+     "_union_write": UnionMetaType._write,
+@@ -378,7 +383,7 @@ class _ReadSourceGenerator(_SourceGenerator):
+         """Generate the code for reading a structure."""
+         read_code = "\n".join(self._generate_fields_source())
+ 
+-        preamble = []
++        preamble = ["if cls._ensure_layout(): return _struct_read(cls, stream, context=context, endian=endian)"]
+         if checks := self._modified_checks():
+             # Fall back to the non-inlined version if any of the inlined types was modified after compilation
+             preamble.append(f"if {' or '.join(checks)}: return {self._fallback()}(cls, stream, context, endian)")
+@@ -428,6 +433,7 @@ class _ReadSourceGenerator(_SourceGenerator):
+         checks = [f"cls is not {self._add_symbol(self.cls, 'cls')}", *self._modified_checks()]
+ 
+         preamble = [
++            "if cls._ensure_layout(): return _union_read(cls, stream, context=context, endian=endian)",
+             f"if {' or '.join(checks)}: return _union_read(cls, stream, context=context, endian=endian)",
+             f"buf = stream.read({size})",
+             _check_eof(size),
+@@ -810,7 +816,10 @@ class _WriteSourceGenerator(_SourceGenerator):
+         # Fall back to the generic method if any of the inlined types was modified after compilation
+         checks = [f"cls is not {self._add_symbol(self.cls, 'cls')}", *self._modified_checks()]
+ 
+-        preamble = [f"if {' or '.join(checks)}: return {interpreted}(cls, stream, data, endian=endian)"]
++        preamble = [
++            "if cls._ensure_layout(): return " + f"{interpreted}(cls, stream, data, endian=endian)",
++            f"if {' or '.join(checks)}: return {interpreted}(cls, stream, data, endian=endian)",
++        ]
+         if self._uses_start:
+             preamble.append("start = stream.tell()")
+ 
+diff --git a/dissect/cstruct/cstruct.py b/dissect/cstruct/cstruct.py
+index b92a66d..e4bec1c 100644
+--- a/dissect/cstruct/cstruct.py
++++ b/dissect/cstruct/cstruct.py
+@@ -204,6 +204,9 @@ class cstruct:
+         self.pointer: type[BaseType] = self.resolve(pointer)
+         self._anonymous_count = 0
+ 
++        # Bumped whenever any type in this instance is re-derived, so readers can detect a stale layout in O(1)
++        self._layout_version = 0
++
+         # Array types are frequently created at runtime (e.g. ``cs.uint32[count]``), so cache them per instance
+         self._make_array_cached = lru_cache(maxsize=4096)(self._make_array_cached)
+ 
+diff --git a/dissect/cstruct/types/structure.py b/dissect/cstruct/types/structure.py
+index d28a8c8..ed5299c 100644
+--- a/dissect/cstruct/types/structure.py
++++ b/dissect/cstruct/types/structure.py
+@@ -44,6 +44,9 @@ class Field:
+         self._name = name or type_.__name__  # The name of the field, or the type name if anonymous
+         self.type = type_
+         self.bits = bits
++        # ``declared_offset`` is what the caller asked for; ``offset`` is what the current layout derived.
++        # Keeping them apart means a re-commit recomputes positions instead of pinning an earlier result.
++        self.declared_offset = offset
+         self.offset = offset
+         self.alignment = type_.__alignment__ or 1
+ 
+@@ -67,6 +70,10 @@ class StructureMetaType(MetaType):
+     __anonymous__: bool
+     __updating__ = False
+     __compiled__ = False
++    # Layout bookkeeping, see ``commit``. Class-level defaults let the freshness check avoid ``getattr`` defaults.
++    __layout_generation__ = 0
++    __layout_version__ = -1
++    __layout_witness__: tuple[tuple[Field, MetaType, int], ...] = ()
+     __static_sizes__: dict[str, int]  # Cache of static sizes by field name
+ 
+     def __new__(metacls, name: str, bases: tuple[type, ...], classdict: dict[str, Any], **kwargs) -> Self:  # type: ignore
+@@ -169,9 +176,9 @@ class StructureMetaType(MetaType):
+         bits_remaining = 0
+ 
+         for field in fields:
+-            if field.offset is not None:
+-                # If a field already has an offset, it's leading
+-                offset = field.offset
++            if field.declared_offset is not None:
++                # If a field has a declared offset, it is leading
++                offset = field.declared_offset
+ 
+             if align and offset is not None:
+                 # Round to next alignment
+@@ -371,17 +378,129 @@ class StructureMetaType(MetaType):
+             cls.__updating__ = False
+ 
+     def commit(cls) -> None:
++        # Array types cache their ``__size__`` at creation, and a field holds the array type it was declared with.
++        # Re-resolve those types first, so the layout is derived from the current element size instead of a stale
++        # cached array.
++        for field in cls.__fields__:
++            field.type = cls._resolve_cached_type(field.type)
++
+         classdict = cls._update_fields(cls.__fields__, cls.__align__)
+ 
+         for key, value in classdict.items():
+             setattr(cls, key, value)
+ 
++        # Record the layout generation of every embedded type that this layout was derived from, so that a stale
++        # layout can be detected without having to guess whether a sample caused it.
++        cls.__layout_generation__ += 1
++        cs = getattr(cls, "__cs__", None)
++        if cs is not None:
++            cs._layout_version += 1
++            cls.__layout_version__ = cs._layout_version
++        cls.__layout_witness__ = tuple(
++            (field, embedded, embedded.__layout_generation__)
++            for field in cls.__fields__
++            for embedded in cls._embedded_structures(field.type)
++        )
++
+         if cls.__compiled__:
+             # If the previous class was compiled try to compile this too
+             from dissect.cstruct import compiler
+ 
+             compiler.compile_structure(cls)
+ 
++        # Structures embedding this one derive offsets and sizes from it, so bring them up to date now instead of
++        # leaving a stale layout visible to ``__size__``, ``cdef()`` or a compiled reader.
++        if not cls.__updating__:
++            cls._refresh_embedders()
++
++    def _refresh_embedders(cls) -> None:
++        """Re-derive the layout of every structure in this cstruct instance that embeds a changed type."""
++        cs = getattr(cls, "__cs__", None)
++        if cs is None:
++            return
++
++        for _ in range(len(cs.types) + 1):
++            stale = [
++                type_
++                for type_ in list(cs.types.values())
++                if isinstance(type_, StructureMetaType)
++                and not getattr(type_, "__updating__", False)
++                and not type_._layout_is_fresh()
++            ]
++            if not stale:
++                return
++
++            for type_ in stale:
++                type_.__updating__ = True
++                try:
++                    type_.commit()
++                finally:
++                    type_.__updating__ = False
++
++    def _resolve_cached_type(cls, type_: type[BaseType]) -> type[BaseType]:
++        """Return an array type that matches the current size of its element structure, rebuilding it if needed."""
++        if not issubclass(type_, BaseArray) or type_.__num_entries__ is None:
++            return type_
++
++        element = type_.__type__
++        if not isinstance(element, StructureMetaType):
++            return type_
++
++        cs = getattr(cls, "__cs__", None)
++        if cs is None or type_.__size__ is not None and not element.__dynamic__ and (
++            type_.__size__ == (type_.__num_entries__ * element.__size__ if element.__size__ is not None else None)
++        ):
++            return type_
++
++        return cs._make_array(element, type_.__num_entries__)
++
++    def _embedded_structures(cls, type_: type[BaseType]) -> tuple[type[BaseType], ...]:
++        """Return the structure types whose size a field of ``type_`` depends on, including through arrays.
++
++        Array types are cached per element type and their ``__size__`` is fixed when the array type is created, so a
++        later change to the element structure leaves the cached array behind. Watching the element generation makes
++        such a cached array detectable, instead of trusting its stale ``__size__``.
++        """
++        embedded = []
++        while issubclass(type_, BaseArray):
++            type_ = type_.__type__
++        if isinstance(type_, StructureMetaType):
++            embedded.append(type_)
++        return tuple(embedded)
++
++    def _layout_is_fresh(cls) -> bool:
++        """Return whether the recorded layout still matches the current layout of every embedded type."""
++        cs = getattr(cls, "__cs__", None)
++        if cs is None:
++            return True
++
++        # Fast path: nothing anywhere in this instance was re-derived since this layout was, so it is fresh.
++        # A single attribute lookup and integer compare keeps the check cheap enough for every read.
++        if cls.__layout_version__ == cs._layout_version:
++            return True
++
++        return all(embedded.__layout_generation__ == generation for _, embedded, generation in cls.__layout_witness__)
++
++    def _ensure_layout(cls) -> bool:
++        """Re-derive the layout if an embedded type changed, returning whether the layout changed.
++
++        A compiled reader has the offsets and sizes of its layout baked into generated code, so a layout change
++        also invalidates it: the compiled methods are replaced by lazily compiling descriptors, which regenerate
++        against the new layout on their next use. Meanwhile the caller uses the interpreted method, which reads the
++        fresh layout dynamically. Both paths therefore always agree on the layout in force.
++        """
++        if getattr(cls, "__updating__", False) or cls._layout_is_fresh():
++            return False
++
++        cls.commit()
++
++        from dissect.cstruct import compiler
++
++        if cls.__compiled__:
++            compiler.compile_structure(cls)
++
++        return True
++
+     def cdef(cls, *, recursive: bool = False) -> str:
+         """Render this structure (or union) back to its C-style definition.
+ 
